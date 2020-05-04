@@ -267,6 +267,12 @@ dfxp_get_end_time(xmlNode *cur_node)
 	return begin + dur;
 }
 
+static int ctr = 0; /* TODO(as): remove; obviously not thread-safe */
+
+/* 
+	dfxp_get_duration returns the duration of the largest end tag found, up
+ 	to a depth limit of 10 nodes.
+ */
 static uint64_t
 dfxp_get_duration(xmlDoc *doc)
 {
@@ -276,33 +282,35 @@ dfxp_get_duration(xmlDoc *doc)
 	unsigned node_stack_pos = 0;
 	int nodes_left = DFXP_DURATION_ESTIMATE_NODES;
 	int64_t result = 0;
-	int64_t cur;
 
-	for (cur_node = xmlDocGetRootElement(doc); ; cur_node = cur_node->prev)
-	{
+	dprintf(4, "%d: ##########\n\n", ctr);
+	for (cur_node = xmlDocGetRootElement(doc); ; cur_node = cur_node->prev){
 		// traverse the tree dfs order (reverse child order)
-		if (cur_node == NULL)
-		{
-			if (node_stack_pos <= 0)
-			{
+		if (cur_node == NULL){
+			if (node_stack_pos <= 0) {
 				break;
 			}
-
 			cur_node = node_stack[--node_stack_pos];
 			continue;
 		}
 
-		if (cur_node->type != XML_ELEMENT_NODE)
-		{
+		if (cur_node->type != XML_ELEMENT_NODE){
 			continue;
 		}
 
+		/* NOTE(as): debug */
+		for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
+		dprintf(4, "%s\n", cur_node->name);
+
+		// get the end time of this node
+		int64_t cur = dfxp_get_end_time(cur_node);
+		if (cur > result){
+			result = cur;
+		}
+
 		// recurse into non-p nodes
-		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0)
-		{
-			if (cur_node->last == NULL || 
-				node_stack_pos >= vod_array_entries(node_stack))
-			{
+		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0){
+			if (cur_node->last == NULL || node_stack_pos >= vod_array_entries(node_stack)){
 				continue;
 			}
 
@@ -314,18 +322,19 @@ dfxp_get_duration(xmlDoc *doc)
 
 		// get the end time of this p node
 		cur = dfxp_get_end_time(cur_node);
-		if (cur > result)
-		{
+		if (cur > result){
 			result = cur;
 		}
 
 		nodes_left--;
-		if (nodes_left <= 0)
-		{
+		if (nodes_left <= 0){
 			break;
 		}
 	}
 	
+	/* NOTE(as): debug */
+	dprintf(4, "%d: result: %d\n", ctr, (int)result);
+	ctr++;
 	return result;
 }
 
