@@ -14,6 +14,7 @@
 #define DFXP_MAX_STACK_DEPTH (10)
 #define DFXP_FRAME_RATE (30)
 
+#define DFXP_ELEMENT_DIV (u_char*)"div"
 #define DFXP_ELEMENT_P (u_char*)"p"
 #define DFXP_ELEMENT_BR (u_char*)"br"
 #define DFXP_ELEMENT_SPAN (u_char*)"span"
@@ -723,9 +724,11 @@ dfxp_parse_frames(
 	uint64_t end;
 
 	dfxp_timestamp *t = malloc(sizeof(*t));
+	dfxp_timestamp *t2 = malloc(sizeof(*t2));
 	t->duration=0;
 	t->start_time = 0;
 	t->end_time=0;
+	*t2=*t;
 
 	int64_t last_start_time = 0;
 	xmlNode* node_stack[DFXP_MAX_STACK_DEPTH];
@@ -799,18 +802,31 @@ dfxp_parse_frames(
 			if (cur_node->children == NULL || node_stack_pos >= vod_array_entries(node_stack)) {
 				continue;
 			}
+
+			/*
+             *  NOTE(as): It's a <div, so parse any timestamps in it in case the file is unusual
+             *  and use the t2 auxillary timestamp value if the <p tag doesn't have the times
+             */
+			if (vod_strcmp(cur_node->name, DFXP_ELEMENT_DIV) != 0){
+				int v = dfxp_tryParseTimestamp(cur_node, t2);
+				for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
+				dprintf(4, "attempted timestamp extraction: %s (%d)\n", cur_node->name, v);
+			}
+
 			node_stack[node_stack_pos++] = cur_node;
 			temp_node.next = cur_node->children;
 			cur_node = &temp_node;
 			continue;
 		}
-//
-		dfxp_tryParseTimestamp(cur_node, t);
+
+		if (!dfxp_tryParseTimestamp(cur_node, t)){
+			*t = *t2;
+		}
 		if ((uint64_t)t->end_time < start) {
 				track->first_frame_index++;
 				continue;
 		}
-		if (t->end_time >= t->start_time){
+		if (t->start_time >= t->end_time){
 			continue;
 		}
 
