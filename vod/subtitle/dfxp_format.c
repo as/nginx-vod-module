@@ -270,7 +270,6 @@ dfxp_get_end_time(xmlNode *cur_node)
 
 
 
-static int ctr = 0;
 static uint64_t
 dfxp_get_duration(xmlDoc *doc)
 {
@@ -281,7 +280,6 @@ dfxp_get_duration(xmlDoc *doc)
 	int nodes_left = DFXP_DURATION_ESTIMATE_NODES;
 	int64_t result = 0;
 
-	dprintf(4, "%d: ######dfxp_get_duration####\n\n", ctr);
 	for (cur_node = xmlDocGetRootElement(doc); ; cur_node = cur_node->prev){
 		// traverse the tree dfs order (reverse child order)
 		if (cur_node == NULL){
@@ -293,10 +291,6 @@ dfxp_get_duration(xmlDoc *doc)
 		}
 
 		if (cur_node->type != XML_ELEMENT_NODE) continue;
-
-		/* debug */
-		for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
-		dprintf(4, "%s\n", cur_node->name);
 
 		int64_t cur = dfxp_get_end_time(cur_node);
 		if (cur > result) result = cur;
@@ -312,14 +306,12 @@ dfxp_get_duration(xmlDoc *doc)
 		}
 
 		cur = dfxp_get_end_time(cur_node);
-		if (cur > result)result = cur;
+		if (cur > result) result = cur;
 
 		nodes_left--;
 		if (nodes_left <= 0)break;
 	}
 	
-	dprintf(4, "%d: result: %d\n", ctr, (int)result);
-	ctr++;
 	return result;
 }
 
@@ -597,7 +589,6 @@ dfxp_get_frame_body(
 	u_char* start;
 	u_char* end;
 	
-	dprintf(4, "dfxp_get_frame_body\n");
 	// get the buffer length
 	alloc_size = dfxp_get_text_content_len(cur_node);
 	if (alloc_size == 0)
@@ -626,8 +617,6 @@ dfxp_get_frame_body(
 			(size_t)(end - start + 2), alloc_size);
 		return VOD_UNEXPECTED;
 	}
-
-	dprintf(4, "TEXT: %s\n", start);
 
 	// trim spaces
 	for (;;)
@@ -679,7 +668,8 @@ typedef struct{
 } dfxp_timestamp;
 
 int64_t
-dfxp_parse_timestamp0(xmlNode *node, xmlChar *name, int64_t *ts){
+dfxp_parse_timestamp0(xmlNode *node, xmlChar *name, int64_t *ts)
+{
 	*ts = -1;
 	xmlChar* attr = dfxp_get_xml_prop(node, name);
 	if (attr == NULL) return -1;
@@ -698,8 +688,15 @@ dfxp_tryParseTimestamp(xmlNode *node, dfxp_timestamp *t)
 	if (t->end_time < 0) t->end_time = t->start_time+t->duration;
 	if (t->duration < 0) t->duration = t->end_time-t->start_time;
 
-	dprintf(4, "s,e,d: %d,%d,%d(%d)\n", (int) t->start_time, (int) t->end_time, (int) t->duration, (int) (t->end_time-t->start_time));
 	return 1;
+}
+
+int64_t
+dfxp_clamp(int64_t v, int64_t lo, int64_t hi)
+{
+	if (v < lo)  return lo;
+	if (v > hi)  return hi;
+	return v;
 }
 
 static vod_status_t
@@ -748,15 +745,13 @@ dfxp_parse_frames(
 	header->len = sizeof(WEBVTT_HEADER_NEWLINES) - 1;
 	header->data = (u_char*)WEBVTT_HEADER_NEWLINES;
 	
-	if ((parse_params->parse_type & PARSE_FLAG_FRAMES_ALL) == 0)
-	{
+	if ((parse_params->parse_type & PARSE_FLAG_FRAMES_ALL) == 0){
 		return VOD_OK;
 	}
 
 	// init the frames array
 	if (vod_array_init(&frames, request_context->pool, 5, sizeof(*cur_frame)) != VOD_OK){
-		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-			"dfxp_parse_frames: vod_array_init failed");
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0, "dfxp_parse_frames: vod_array_init failed");
 		return VOD_ALLOC_FAILED;
 	}
 
@@ -787,30 +782,18 @@ dfxp_parse_frames(
 			continue;
 		}
 
-		/* debug */
-		for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
-		dprintf(4, "%s", cur_node->name);
-
 		if (cur_node->type != XML_ELEMENT_NODE){
-			for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
-			dprintf(4, "(skipped)\n");
 			continue;
 		}
-		dprintf(4, "\n");
 
 		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0){
 			if (cur_node->children == NULL || node_stack_pos >= vod_array_entries(node_stack)) {
 				continue;
 			}
 
-			/*
-             *  NOTE(as): It's a <div, so parse any timestamps in it in case the file is unusual
-             *  and use the t2 auxillary timestamp value if the <p tag doesn't have the times
-             */
+			/* NOTE(as): It's a <div, so parse any timestamps in it in case its not in p-tag */
 			if (vod_strcmp(cur_node->name, DFXP_ELEMENT_DIV) != 0){
-				int v = dfxp_tryParseTimestamp(cur_node, t2);
-				for (uint i = 0; i < node_stack_pos; i++) dprintf(4, "\t");
-				dprintf(4, "attempted timestamp extraction: %s (%d)\n", cur_node->name, v);
+				dfxp_tryParseTimestamp(cur_node, t2);
 			}
 
 			node_stack[node_stack_pos++] = cur_node;
@@ -820,6 +803,7 @@ dfxp_parse_frames(
 		}
 
 		if (!dfxp_tryParseTimestamp(cur_node, t)){
+			/* NOTE(as): p-tag has no timestamp, fallback to last div */
 			*t = *t2;
 		}
 		if ((uint64_t)t->end_time < start) {
@@ -830,43 +814,16 @@ dfxp_parse_frames(
 			continue;
 		}
 
-/*
-	start_time = clamp(start_time, base_time, base_time+clip_to) - base_time;
-	end_time = clamp(end_time, end_time, base_time+clip_to) - base_time;
-*/
-		// apply clipping
-		if (t->start_time >= (int64_t)base_time)
-		{
-			t->start_time -= base_time;
-			if ((uint64_t)t->start_time > clip_to)
-			{
-				t->start_time = clip_to;
-			}
-		}
-		else
-		{
-			t->start_time = 0;
-		}
-
-		t->end_time -= base_time;
-		if ((uint64_t) t->end_time > clip_to)
-		{
-			t->end_time = clip_to;
-		}
+		t->start_time = dfxp_clamp(t->start_time - base_time, 0, clip_to);
+		t->end_time = dfxp_clamp(t->end_time - base_time, 0, clip_to);
 
 		// get the text
-		rc = dfxp_get_frame_body(
-			request_context,
-			cur_node->children,
-			&text);
-		switch (rc)
-		{
+		rc = dfxp_get_frame_body(request_context,cur_node->children,&text);
+		switch (rc){
 		case VOD_NOT_FOUND:
 			continue;
-
 		case VOD_OK:
 			break;
-
 		default:
 			return rc;
 		}
@@ -885,10 +842,8 @@ dfxp_parse_frames(
 
 		// add the frame
 		cur_frame = vod_array_push(&frames);
-		if (cur_frame == NULL)
-		{
-			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-				"dfxp_parse_frames: vod_array_push failed");
+		if (cur_frame == NULL){
+			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,"dfxp_parse_frames: vod_array_push failed");
 			return VOD_ALLOC_FAILED;
 		}
 
@@ -906,6 +861,8 @@ dfxp_parse_frames(
 	track->frames.last_frame = track->frames.first_frame + frames.nelts;
 
 	return VOD_OK;
+
+
 }
 
 void
