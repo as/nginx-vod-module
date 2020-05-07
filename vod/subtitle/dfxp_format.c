@@ -720,16 +720,13 @@ dfxp_parse_frames(
 	uint64_t start;
 	uint64_t end;
 
-	dfxp_timestamp *t = malloc(sizeof(*t));
-	dfxp_timestamp *t2 = malloc(sizeof(*t2));
-	t->duration=0;
-	t->start_time = 0;
-	t->end_time=0;
-	*t2=*t;
+
+	dfxp_timestamp t = {0};
 
 	int64_t last_start_time = 0;
 	xmlNode* node_stack[DFXP_MAX_STACK_DEPTH];
 	xmlNode* cur_node;
+	xmlNode* last_div = NULL;
 	xmlNode temp_node;
 	unsigned node_stack_pos = 0;
 	vod_str_t text;
@@ -773,8 +770,8 @@ dfxp_parse_frames(
 		if (cur_node == NULL){
 			if (node_stack_pos <= 0){
 				if (cur_frame != NULL){
-					cur_frame->duration = t->end_time - t->start_time;
-					track->total_frames_duration = t->end_time - track->first_frame_time_offset;
+					cur_frame->duration = t.end_time - t.start_time;
+					track->total_frames_duration = t.end_time - track->first_frame_time_offset;
 				}
 				break;
 			}
@@ -791,9 +788,9 @@ dfxp_parse_frames(
 				continue;
 			}
 
-			/* NOTE(as): It's a <div, so parse any timestamps in it in case its not in p-tag */
-			if (vod_strcmp(cur_node->name, DFXP_ELEMENT_DIV) != 0){
-				dfxp_tryParseTimestamp(cur_node, t2);
+			/* NOTE(as): It's a <div, so save it in case the p-tag doesn't have the time inside */
+			if (vod_strcmp(cur_node->name, DFXP_ELEMENT_DIV) == 0){
+				last_div = cur_node;
 			}
 
 			node_stack[node_stack_pos++] = cur_node;
@@ -802,20 +799,22 @@ dfxp_parse_frames(
 			continue;
 		}
 
-		if (!dfxp_tryParseTimestamp(cur_node, t)){
+		if (!dfxp_tryParseTimestamp(cur_node, &t)){
 			/* NOTE(as): p-tag has no timestamp, fallback to last div */
-			*t = *t2;
+			if (last_div == NULL || !dfxp_tryParseTimestamp(last_div, &t)) {
+				continue;
+			}
 		}
-		if ((uint64_t)t->end_time < start) {
+		if ((uint64_t)t.end_time < start) {
 				track->first_frame_index++;
 				continue;
 		}
-		if (t->start_time >= t->end_time){
+		if (t.start_time >= t.end_time){
 			continue;
 		}
 
-		t->start_time = dfxp_clamp(t->start_time - base_time, 0, clip_to);
-		t->end_time = dfxp_clamp(t->end_time - base_time, 0, clip_to);
+		t.start_time = dfxp_clamp(t.start_time - base_time, 0, clip_to);
+		t.end_time = dfxp_clamp(t.end_time - base_time, 0, clip_to);
 
 		// get the text
 		rc = dfxp_get_frame_body(request_context,cur_node->children,&text);
@@ -830,13 +829,13 @@ dfxp_parse_frames(
 
 		// adjust the duration of the previous frame
 		if (cur_frame != NULL) {
-			cur_frame->duration = t->start_time - last_start_time;
+			cur_frame->duration = t.start_time - last_start_time;
 		} else {
-			track->first_frame_time_offset = t->start_time;
+			track->first_frame_time_offset = t.start_time;
 		}
 
-		if ((uint64_t)t->start_time >= end) {
-			track->total_frames_duration = t->start_time - track->first_frame_time_offset;
+		if ((uint64_t)t.start_time >= end) {
+			track->total_frames_duration = t.start_time - track->first_frame_time_offset;
 			break;
 		}
 
@@ -849,11 +848,11 @@ dfxp_parse_frames(
 
 		cur_frame->offset = (uintptr_t)text.data;
 		cur_frame->size = text.len;
-		cur_frame->pts_delay = t->end_time - t->start_time;
+		cur_frame->pts_delay = t.end_time - t.start_time;
 		cur_frame->key_frame = 0;
 		track->total_frames_size += cur_frame->size;
 
-		last_start_time = t->start_time;
+		last_start_time = t.start_time;
 	}
 
 	track->frame_count = frames.nelts;
