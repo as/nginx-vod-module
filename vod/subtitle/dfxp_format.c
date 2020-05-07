@@ -14,6 +14,7 @@
 #define DFXP_MAX_STACK_DEPTH (10)
 #define DFXP_FRAME_RATE (30)
 
+#define DFXP_ELEMENT_DIV (u_char*)"div"
 #define DFXP_ELEMENT_P (u_char*)"p"
 #define DFXP_ELEMENT_BR (u_char*)"br"
 #define DFXP_ELEMENT_SPAN (u_char*)"span"
@@ -267,6 +268,8 @@ dfxp_get_end_time(xmlNode *cur_node)
 	return begin + dur;
 }
 
+
+
 static uint64_t
 dfxp_get_duration(xmlDoc *doc)
 {
@@ -276,58 +279,42 @@ dfxp_get_duration(xmlDoc *doc)
 	unsigned node_stack_pos = 0;
 	int nodes_left = DFXP_DURATION_ESTIMATE_NODES;
 	int64_t result = 0;
-	int64_t cur;
 
-	for (cur_node = xmlDocGetRootElement(doc); ; cur_node = cur_node->prev)
-	{
+	for (cur_node = xmlDocGetRootElement(doc); ; cur_node = cur_node->prev){
 		// traverse the tree dfs order (reverse child order)
-		if (cur_node == NULL)
-		{
-			if (node_stack_pos <= 0)
-			{
+		if (cur_node == NULL){
+			if (node_stack_pos <= 0) {
 				break;
 			}
-
 			cur_node = node_stack[--node_stack_pos];
 			continue;
 		}
 
-		if (cur_node->type != XML_ELEMENT_NODE)
-		{
-			continue;
-		}
+		if (cur_node->type != XML_ELEMENT_NODE) continue;
+
+		int64_t cur = dfxp_get_end_time(cur_node);
+		if (cur > result) result = cur;
 
 		// recurse into non-p nodes
-		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0)
-		{
-			if (cur_node->last == NULL || 
-				node_stack_pos >= vod_array_entries(node_stack))
-			{
-				continue;
+		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0){
+			if (cur_node->last != NULL && node_stack_pos < vod_array_entries(node_stack)){
+				node_stack[node_stack_pos++] = cur_node;
+				temp_node.prev = cur_node->last;
+				cur_node = &temp_node;
 			}
-
-			node_stack[node_stack_pos++] = cur_node;
-			temp_node.prev = cur_node->last;
-			cur_node = &temp_node;
 			continue;
 		}
 
-		// get the end time of this p node
 		cur = dfxp_get_end_time(cur_node);
-		if (cur > result)
-		{
-			result = cur;
-		}
+		if (cur > result) result = cur;
 
 		nodes_left--;
-		if (nodes_left <= 0)
-		{
-			break;
-		}
+		if (nodes_left <= 0)break;
 	}
 	
 	return result;
 }
+
 
 static void
 dfxp_strip_new_lines(u_char* buf, size_t n)
@@ -337,10 +324,8 @@ dfxp_strip_new_lines(u_char* buf, size_t n)
 
 	end = buf + n;
 
-	for (p = buf; p < end; p++)
-	{
-		if (*p == CR || *p == LF)
-		{
+	for (p = buf; p < end; p++){
+		if (*p == CR || *p == LF){
 			*p = ' ';
 		}
 	}
@@ -676,6 +661,44 @@ dfxp_get_frame_body(
 	return VOD_OK;
 }
 
+typedef struct{
+	int64_t start_time;
+	int64_t end_time;
+	int64_t duration;
+} dfxp_timestamp;
+
+int64_t
+dfxp_parse_timestamp0(xmlNode *node, xmlChar *name, int64_t *ts)
+{
+	*ts = -1;
+	xmlChar* attr = dfxp_get_xml_prop(node, name);
+	if (attr == NULL) return -1;
+	*ts =  dfxp_parse_timestamp(attr);
+	return *ts;
+}
+
+int
+dfxp_tryParseTimestamp(xmlNode *node, dfxp_timestamp *t)
+{
+	dfxp_parse_timestamp0(node, DFXP_ATTR_BEGIN, &t->start_time);
+	dfxp_parse_timestamp0(node, DFXP_ATTR_END, &t->end_time);
+	dfxp_parse_timestamp0(node, DFXP_ATTR_DUR, &t->duration);
+
+	if (t->start_time < 0) return 0;
+	if (t->end_time < 0) t->end_time = t->start_time+t->duration;
+	if (t->duration < 0) t->duration = t->end_time-t->start_time;
+
+	return 1;
+}
+
+int64_t
+dfxp_clamp(int64_t v, int64_t lo, int64_t hi)
+{
+	if (v < lo)  return lo;
+	if (v > hi)  return hi;
+	return v;
+}
+
 static vod_status_t
 dfxp_parse_frames(
 	request_context_t* request_context,
@@ -696,14 +719,15 @@ dfxp_parse_frames(
 	uint64_t clip_to;
 	uint64_t start;
 	uint64_t end;
+
+
+	dfxp_timestamp t = {0};
+
 	int64_t last_start_time = 0;
-	int64_t start_time = 0;
-	int64_t end_time = 0;
-	int64_t duration;
 	xmlNode* node_stack[DFXP_MAX_STACK_DEPTH];
 	xmlNode* cur_node;
+	xmlNode* last_div = NULL;
 	xmlNode temp_node;
-	xmlChar* attr;
 	unsigned node_stack_pos = 0;
 	vod_str_t text;
 	vod_status_t rc;
@@ -718,65 +742,55 @@ dfxp_parse_frames(
 	header->len = sizeof(WEBVTT_HEADER_NEWLINES) - 1;
 	header->data = (u_char*)WEBVTT_HEADER_NEWLINES;
 	
-	if ((parse_params->parse_type & PARSE_FLAG_FRAMES_ALL) == 0)
-	{
+	if ((parse_params->parse_type & PARSE_FLAG_FRAMES_ALL) == 0){
 		return VOD_OK;
 	}
 
 	// init the frames array
-	if (vod_array_init(&frames, request_context->pool, 5, sizeof(*cur_frame)) != VOD_OK)
-	{
-		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-			"dfxp_parse_frames: vod_array_init failed");
+	if (vod_array_init(&frames, request_context->pool, 5, sizeof(*cur_frame)) != VOD_OK){
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0, "dfxp_parse_frames: vod_array_init failed");
 		return VOD_ALLOC_FAILED;
 	}
 
 	// get the start / end offsets
 	start = parse_params->range->start + parse_params->clip_from;
 
-	if ((parse_params->parse_type & PARSE_FLAG_RELATIVE_TIMESTAMPS) != 0)
-	{
+	if ((parse_params->parse_type & PARSE_FLAG_RELATIVE_TIMESTAMPS) != 0){
 		base_time = start;
 		clip_to = parse_params->range->end - parse_params->range->start;
 		end = clip_to;
-	}
-	else
-	{
+	} else {
 		base_time = parse_params->clip_from;
 		clip_to = parse_params->clip_to;
 		end = parse_params->range->end;		// Note: not adding clip_from, since end is checked after the clipping is applied to the timestamps
 	}
 
-	for (cur_node = xmlDocGetRootElement(metadata->context); ; cur_node = cur_node->next)
-	{
+	for (cur_node = xmlDocGetRootElement(metadata->context); ; cur_node = cur_node->next){
 		// traverse the tree dfs order
-		if (cur_node == NULL)
-		{
-			if (node_stack_pos <= 0)
-			{
-				if (cur_frame != NULL)
-				{
-					cur_frame->duration = end_time - start_time;
-					track->total_frames_duration = end_time - track->first_frame_time_offset;
+		if (cur_node == NULL){
+			if (node_stack_pos <= 0){
+				if (cur_frame != NULL){
+					cur_frame->duration = t.end_time - t.start_time;
+					track->total_frames_duration = t.end_time - track->first_frame_time_offset;
 				}
 				break;
 			}
-
 			cur_node = node_stack[--node_stack_pos];
 			continue;
 		}
 
-		if (cur_node->type != XML_ELEMENT_NODE)
-		{
+		if (cur_node->type != XML_ELEMENT_NODE){
 			continue;
 		}
 
-		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0)
-		{
-			if (cur_node->children == NULL ||
-				node_stack_pos >= vod_array_entries(node_stack))
-			{
+		if (vod_strcmp(cur_node->name, DFXP_ELEMENT_P) != 0){
+			if (cur_node->children == NULL || node_stack_pos >= vod_array_entries(node_stack)) {
 				continue;
+			}
+
+			/* NOTE(as): It's a <div, so save it in case the p-tag doesn't have the time inside */
+			if (vod_strcmp(cur_node->name, DFXP_ELEMENT_DIV) == 0){
+				last_div = cur_node;
 			}
 
 			node_stack[node_stack_pos++] = cur_node;
@@ -785,144 +799,60 @@ dfxp_parse_frames(
 			continue;
 		}
 
-		// handle p element
-		attr = dfxp_get_xml_prop(cur_node, DFXP_ATTR_END);
-		if (attr != NULL)
-		{
-			// has end time
-			end_time = dfxp_parse_timestamp(attr);
-			if (end_time < 0)
-			{
-				continue;
-			}
-
-			if ((uint64_t)end_time < start)
-			{
-				track->first_frame_index++;
-				continue;
-			}
-
-			attr = dfxp_get_xml_prop(cur_node, DFXP_ATTR_BEGIN);
-			if (attr == NULL)
-			{
-				continue;
-			}
-
-			start_time = dfxp_parse_timestamp(attr);
-			if (start_time < 0)
-			{
+		if (!dfxp_tryParseTimestamp(cur_node, &t)){
+			/* NOTE(as): p-tag has no timestamp, fallback to last div */
+			if (last_div == NULL || !dfxp_tryParseTimestamp(last_div, &t)) {
 				continue;
 			}
 		}
-		else
-		{
-			// no end time
-			attr = dfxp_get_xml_prop(cur_node, DFXP_ATTR_DUR);
-			if (attr == NULL)
-			{
-				continue;
-			}
-
-			duration = dfxp_parse_timestamp(attr);
-			if (duration < 0)
-			{
-				continue;
-			}
-
-			attr = dfxp_get_xml_prop(cur_node, DFXP_ATTR_BEGIN);
-			if (attr == NULL)
-			{
-				continue;
-			}
-
-			start_time = dfxp_parse_timestamp(attr);
-			if (start_time < 0)
-			{
-				continue;
-			}
-
-			end_time = start_time + duration;
-			if ((uint64_t)end_time < start)
-			{
+		if ((uint64_t)t.end_time < start) {
 				track->first_frame_index++;
 				continue;
-			}
 		}
-
-		if (start_time >= end_time)
-		{
+		if (t.start_time >= t.end_time){
 			continue;
 		}
 
-		// apply clipping
-		if (start_time >= (int64_t)base_time)
-		{
-			start_time -= base_time;
-			if ((uint64_t)start_time > clip_to)
-			{
-				start_time = clip_to;
-			}
-		}
-		else
-		{
-			start_time = 0;
-		}
-
-		end_time -= base_time;
-		if ((uint64_t)end_time > clip_to)
-		{
-			end_time = clip_to;
-		}
+		t.start_time = dfxp_clamp(t.start_time - base_time, 0, clip_to);
+		t.end_time = dfxp_clamp(t.end_time - base_time, 0, clip_to);
 
 		// get the text
-		rc = dfxp_get_frame_body(
-			request_context,
-			cur_node->children,
-			&text);
-		switch (rc)
-		{
+		rc = dfxp_get_frame_body(request_context,cur_node->children,&text);
+		switch (rc){
 		case VOD_NOT_FOUND:
 			continue;
-
 		case VOD_OK:
 			break;
-
 		default:
 			return rc;
 		}
 
 		// adjust the duration of the previous frame
-		if (cur_frame != NULL)
-		{
-			cur_frame->duration = start_time - last_start_time;
-		}
-		else
-		{
-			track->first_frame_time_offset = start_time;
+		if (cur_frame != NULL) {
+			cur_frame->duration = t.start_time - last_start_time;
+		} else {
+			track->first_frame_time_offset = t.start_time;
 		}
 
-		if ((uint64_t)start_time >= end)
-		{
-			track->total_frames_duration = start_time - track->first_frame_time_offset;
+		if ((uint64_t)t.start_time >= end) {
+			track->total_frames_duration = t.start_time - track->first_frame_time_offset;
 			break;
 		}
 
 		// add the frame
 		cur_frame = vod_array_push(&frames);
-		if (cur_frame == NULL)
-		{
-			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
-				"dfxp_parse_frames: vod_array_push failed");
+		if (cur_frame == NULL){
+			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,"dfxp_parse_frames: vod_array_push failed");
 			return VOD_ALLOC_FAILED;
 		}
 
 		cur_frame->offset = (uintptr_t)text.data;
 		cur_frame->size = text.len;
-		cur_frame->pts_delay = end_time - start_time;
+		cur_frame->pts_delay = t.end_time - t.start_time;
 		cur_frame->key_frame = 0;
 		track->total_frames_size += cur_frame->size;
 
-		last_start_time = start_time;
+		last_start_time = t.start_time;
 	}
 
 	track->frame_count = frames.nelts;
@@ -930,6 +860,8 @@ dfxp_parse_frames(
 	track->frames.last_frame = track->frames.first_frame + frames.nelts;
 
 	return VOD_OK;
+
+
 }
 
 void
